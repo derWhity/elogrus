@@ -7,30 +7,32 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-
 	"gopkg.in/olivere/elastic.v5"
 )
 
 var (
-	// Fired if the
-	// index is not created
+	// ErrCannotCreateIndex is fired if index creation fails
 	ErrCannotCreateIndex = fmt.Errorf("Cannot create index")
 )
 
+// IndexNameFunc defines a function that will dynamically create an index name
 type IndexNameFunc func() string
 
 type fireFunc func(entry *logrus.Entry, hook *ElasticHook, indexName string) error
 
+type MessageCreatorFunc func(entry *logrus.Entry, hook *ElasticHook) interface{}
+
 // ElasticHook is a logrus
 // hook for ElasticSearch
 type ElasticHook struct {
-	client    *elastic.Client
-	host      string
-	index     IndexNameFunc
-	levels    []logrus.Level
-	ctx       context.Context
-	ctxCancel context.CancelFunc
-	fireFunc  fireFunc
+	client         *elastic.Client
+	host           string
+	index          IndexNameFunc
+	levels         []logrus.Level
+	ctx            context.Context
+	ctxCancel      context.CancelFunc
+	fireFunc       fireFunc
+	messageCreator MessageCreatorFunc // Function to use when creating the message for Elasticsearch
 }
 
 // NewElasticHook creates new hook
@@ -42,7 +44,7 @@ func NewElasticHook(client *elastic.Client, host string, level logrus.Level, ind
 	return NewElasticHookWithFunc(client, host, level, func() string { return index })
 }
 
-// NewElasticHook creates new  hook with asynchronous log
+// NewAsyncElasticHook creates new  hook with asynchronous log
 // client - ElasticSearch client using gopkg.in/olivere/elastic.v5
 // host - host of system
 // level - log level
@@ -94,26 +96,30 @@ func newHookFuncAndFireFunc(client *elastic.Client, host string, level logrus.Le
 	exists, err := client.IndexExists(indexFunc()).Do(ctx)
 	if err != nil {
 		// Handle error
+		cancel()
 		return nil, err
 	}
 	if !exists {
 		createIndex, err := client.CreateIndex(indexFunc()).Do(ctx)
 		if err != nil {
+			cancel()
 			return nil, err
 		}
 		if !createIndex.Acknowledged {
+			cancel()
 			return nil, ErrCannotCreateIndex
 		}
 	}
 
 	return &ElasticHook{
-		client:    client,
-		host:      host,
-		index:     indexFunc,
-		levels:    levels,
-		ctx:       ctx,
-		ctxCancel: cancel,
-		fireFunc:  fireFunc,
+		client:         client,
+		host:           host,
+		index:          indexFunc,
+		levels:         levels,
+		ctx:            ctx,
+		ctxCancel:      cancel,
+		fireFunc:       fireFunc,
+		messageCreator: defaultMessageCreator,
 	}, nil
 }
 
@@ -128,16 +134,10 @@ func asyncFireFunc(entry *logrus.Entry, hook *ElasticHook, indexName string) err
 	return nil
 }
 
-func syncFireFunc(entry *logrus.Entry, hook *ElasticHook, indexName string) error {
+// defaultMessageCreator is the default function used for Elasticsearch message creation
+func defaultMessageCreator(entry *logrus.Entry, hook *ElasticHook) interface{} {
 	level := entry.Level.String()
-
-	if e, ok := entry.Data[logrus.ErrorKey]; ok && e != nil {
-		if err, ok := e.(error); ok {
-			entry.Data[logrus.ErrorKey] = err.Error()
-		}
-	}
-
-	msg := struct {
+	return &struct {
 		Host      string
 		Timestamp string `json:"@timestamp"`
 		Message   string
@@ -150,6 +150,17 @@ func syncFireFunc(entry *logrus.Entry, hook *ElasticHook, indexName string) erro
 		entry.Data,
 		strings.ToUpper(level),
 	}
+}
+
+func syncFireFunc(entry *logrus.Entry, hook *ElasticHook, indexName string) error {
+
+	if e, ok := entry.Data[logrus.ErrorKey]; ok && e != nil {
+		if err, ok := e.(error); ok {
+			entry.Data[logrus.ErrorKey] = err.Error()
+		}
+	}
+
+	msg := hook.messageCreator(entry, hook)
 
 	_, err := hook.client.
 		Index().
@@ -161,14 +172,23 @@ func syncFireFunc(entry *logrus.Entry, hook *ElasticHook, indexName string) erro
 	return err
 }
 
-// Required for logrus
+// Levels is an interface function required for logrus
 // hook implementation
 func (hook *ElasticHook) Levels() []logrus.Level {
 	return hook.levels
 }
 
-// Cancels all calls to
-// elastic
+// Cancel will cancel all calls to elastic
 func (hook *ElasticHook) Cancel() {
 	hook.ctxCancel()
+}
+
+// SetMessageCreator changes the message creation function to the provided one
+func (hook *ElasticHook) SetMessageCreator(fn MessageCreatorFunc) {
+	hook.messageCreator = fn
+}
+
+// GetHost returns the host configured in the hook instance
+func (hook *ElasticHook) GetHost() string {
+	return hook.host
 }
