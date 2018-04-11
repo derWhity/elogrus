@@ -20,6 +20,8 @@ type IndexNameFunc func() string
 
 type fireFunc func(entry *logrus.Entry, hook *ElasticHook, indexName string) error
 
+// MessageCreatorFunc is a function that can be used to create a message that will be sent to ElasticSearch based
+// on an incoming log entry
 type MessageCreatorFunc func(entry *logrus.Entry, hook *ElasticHook) interface{}
 
 // ElasticHook is a logrus
@@ -152,7 +154,16 @@ func defaultMessageCreator(entry *logrus.Entry, hook *ElasticHook) interface{} {
 	}
 }
 
+const (
+	skipKey = "logrus.skipEntry"
+)
+
 func syncFireFunc(entry *logrus.Entry, hook *ElasticHook, indexName string) error {
+
+	// Skip a self-logged message?
+	if _, ok := entry.Data[skipKey]; ok {
+		return nil
+	}
 
 	if e, ok := entry.Data[logrus.ErrorKey]; ok && e != nil {
 		if err, ok := e.(error); ok {
@@ -169,6 +180,9 @@ func syncFireFunc(entry *logrus.Entry, hook *ElasticHook, indexName string) erro
 		BodyJson(msg).
 		Do(hook.ctx)
 
+	if err != nil {
+		entry.WithError(err).WithField(skipKey, true).Warn("Failed to send log entry to ElasticSearch.")
+	}
 	return err
 }
 
